@@ -18,12 +18,16 @@ from .rules import (
     register_upstream_rules,
 )
 from .rules import ad as _ad
+from . import _chainrules as _second_ad
 
 ZERO = _ad.ZERO
 grad = _ad.grad
 jvp = _ad.jvp
 value_and_grad = _ad.value_and_grad
 vjp = _ad.vjp
+nested_jvp = _second_ad.nested_jvp
+hvp = _second_ad.hvp
+value_grad_and_hvp = _second_ad.value_grad_and_hvp
 
 __all__ = [
     "ZERO",
@@ -39,4 +43,7 @@ __all__ = [
     "register_upstream_rules",
     "value_and_grad",
     "vjp",
+    "nested_jvp",
+    "hvp",
+    "value_grad_and_hvp",
 ]

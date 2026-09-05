@@ -14,11 +14,17 @@ from collections.abc import Callable, Iterable, Mapping
 from typing import Any
 
 import numpy as np
+from ._second_order import traceable
 
 try:  # Prefer the standalone ChainRules package when available.
     import chainrules as ad
 except ModuleNotFoundError:  # pragma: no cover - exercised in clean offline venvs
     from . import _chainrules as ad
+from . import _chainrules as second_ad
+# Keep the sentinel used by second-order rules identical to the selected
+# first-order backend when an external ChainRules package is installed.
+if ad is not second_ad:  # pragma: no cover - exercised with external backend
+    second_ad.ZERO = ad.ZERO
 
 
 def _native(path: str) -> Callable[..., Any]:
@@ -70,6 +76,7 @@ def _input_gradient(value: np.ndarray, gradient: np.ndarray) -> np.ndarray:
     return np.real(gradient) if not np.iscomplexobj(value) else gradient
 
 
+@traceable
 def KL_div(p1: object, p2: object) -> Any:
     """Call :func:`quspin.tools.misc.KL_div` (primal only)."""
     return _native("quspin.tools.misc.KL_div")(p1, p2)
@@ -121,6 +128,25 @@ def _kl_vjp(
     return value, pullback
 
 
+@second_ad.rules.jvp2_for(KL_div)
+def _kl_jvp2(
+    tangents: Mapping[str, object], nested: Mapping[str, object], p1: object, p2: object
+) -> tuple[Any, object, object]:
+    value = KL_div(p1, p2)
+    _unsupported(KL_div, set(tangents) | set(nested), ("p1", "p2"))
+    x, y = _array(p1, name="p1"), _array(p2, name="p2")
+    ux, uy = _active(tangents, "p1"), _active(tangents, "p2")
+    vx, vy = _active(nested, "p1"), _active(nested, "p2")
+    ux = np.zeros_like(x) if ux is ad.ZERO else _same_shape(ux, x, name="dp1")
+    uy = np.zeros_like(y) if uy is ad.ZERO else _same_shape(uy, y, name="dp2")
+    vx = np.zeros_like(x) if vx is ad.ZERO else _same_shape(vx, x, name="nested dp1")
+    vy = np.zeros_like(y) if vy is ad.ZERO else _same_shape(vy, y, name="nested dp2")
+    tangent = np.sum((np.log(x / y) + 1) * ux - (x / y) * uy)
+    mixed = np.sum(ux * vx / x - ux * vy / y - vx * uy / y + x * uy * vy / y**2)
+    return value, tangent, mixed
+
+
+@traceable
 def coherent_state(a: object, n: int, dtype: object = np.float64) -> Any:
     """Call :func:`quspin.basis.coherent_state` (primal only)."""
     return _native("quspin.basis.coherent_state")(a, n, dtype=dtype)
@@ -188,11 +214,33 @@ def _coherent_vjp(
     return value, pullback
 
 
+@second_ad.rules.jvp2_for(coherent_state)
+def _coherent_jvp2(
+    tangents: Mapping[str, object], nested: Mapping[str, object], a: object, n: int,
+    dtype: object = np.float64
+) -> tuple[Any, object, object]:
+    value = coherent_state(a, n, dtype=dtype)
+    _unsupported(coherent_state, set(tangents) | set(nested), ("a",))
+    u, v = _active(tangents, "a"), _active(nested, "a")
+    if u is ad.ZERO: u = 0.0
+    if v is ad.ZERO: v = 0.0
+    first = _coherent_linearization(np.asarray(value), a, u)
+    aa = np.asarray(a)
+    k = np.arange(value.size, dtype=np.result_type(value.dtype, np.float64))
+    lu = -np.real(np.conj(aa) * u) + k * u / aa
+    lv = -np.real(np.conj(aa) * v) + k * v / aa
+    dl = -np.real(np.conj(v) * u) - k * u * v / aa**2
+    mixed = np.asarray(value) * (lu * lv + dl)
+    return value, first, mixed
+
+
+@traceable
 def commutator(H1: object, H2: object) -> Any:
     """Call :func:`quspin.operators.commutator` (primal only)."""
     return _native("quspin.operators.commutator")(H1, H2)
 
 
+@traceable
 def anti_commutator(H1: object, H2: object) -> Any:
     """Call :func:`quspin.operators.anti_commutator` (primal only)."""
     return _native("quspin.operators.anti_commutator")(H1, H2)
@@ -295,6 +343,34 @@ def _anti_vjp(
     return _binary_vjp(anti_commutator, wrt, H1, H2, True)
 
 
+def _binary_jvp2(fn, tangents, nested, H1, H2, plus):
+    value, first = _binary_jvp(fn, tangents, H1, H2, plus)
+    _unsupported(fn, set(nested), ("H1", "H2"))
+    a, b = _matrix(H1, name="H1"), _matrix(H2, name="H2")
+    u1, u2 = _active(tangents, "H1"), _active(tangents, "H2")
+    v1, v2 = _active(nested, "H1"), _active(nested, "H2")
+    z1 = np.zeros_like(a) if u1 is ad.ZERO else _same_shape(u1, a, name="dH1")
+    z2 = np.zeros_like(b) if u2 is ad.ZERO else _same_shape(u2, b, name="dH2")
+    w1 = np.zeros_like(a) if v1 is ad.ZERO else _same_shape(v1, a, name="nested dH1")
+    w2 = np.zeros_like(b) if v2 is ad.ZERO else _same_shape(v2, b, name="nested dH2")
+    if plus:
+        mixed = z1 @ w2 + w1 @ z2 + w2 @ z1 + z2 @ w1
+    else:
+        mixed = z1 @ w2 + w1 @ z2 - w2 @ z1 - z2 @ w1
+    return value, first, mixed
+
+
+@second_ad.rules.jvp2_for(commutator)
+def _comm_jvp2(tangents, nested, H1, H2):
+    return _binary_jvp2(commutator, tangents, nested, H1, H2, False)
+
+
+@second_ad.rules.jvp2_for(anti_commutator)
+def _anti_jvp2(tangents, nested, H1, H2):
+    return _binary_jvp2(anti_commutator, tangents, nested, H1, H2, True)
+
+
+@traceable
 def ED_state_vs_time(
     psi: object, E: object, V: object, times: object, iterate: bool = False
 ) -> Any:
@@ -411,11 +487,37 @@ def _ed_vjp(
     return value, pullback
 
 
+@second_ad.rules.jvp2_for(ED_state_vs_time)
+def _ed_jvp2(tangents, nested, psi, E, V, times, iterate=False):
+    if iterate:
+        raise ad.NonDifferentiablePoint("ED_state_vs_time AD requires iterate=False")
+    value, phase, coeff, mat, t = _ed_forward(psi, E, V, times)
+    _unsupported(ED_state_vs_time, set(tangents) | set(nested), ("psi", "E", "times"))
+    p, e = _array(psi, name="psi"), _array(E, name="E")
+    def parts(direction, label):
+        dp = np.zeros_like(p) if direction.get("psi", ad.ZERO) is ad.ZERO else _same_shape(direction["psi"], p, name=label + " psi")
+        de = np.zeros_like(e) if direction.get("E", ad.ZERO) is ad.ZERO else _same_shape(direction["E"], e, name=label + " E")
+        dt = np.zeros_like(t) if direction.get("times", ad.ZERO) is ad.ZERO else _same_shape(direction["times"], t, name=label + " times")
+        dc = mat.conj().T @ dp
+        ell = -1j * (dt[:, None] * e[None, :] + t[:, None] * de[None, :])
+        return dc, ell, dp, de, dt
+    cu, lu, _, _, _ = parts(tangents, "d")
+    cv, lv, _, dev, dtv = parts(nested, "nested d")
+    deu = np.zeros_like(e) if tangents.get("E", ad.ZERO) is ad.ZERO else _same_shape(tangents["E"], e, name="dE")
+    dtu = np.zeros_like(t) if tangents.get("times", ad.ZERO) is ad.ZERO else _same_shape(tangents["times"], t, name="dtimes")
+    luv = -1j * (dtu[:, None] * dev[None, :] + dtv[:, None] * deu[None, :])
+    first = mat @ (phase * (lu * coeff[None, :] + cu[None, :])).T
+    mixed = mat @ (phase * ((lu * lv + luv) * coeff[None, :] + lu * cv[None, :] + lv * cu[None, :])).T
+    return value, first, mixed
+
+
+@traceable
 def lin_comb_Q_T(coeff: object, Q_T: object, out: object = None) -> Any:
     """Call :func:`quspin.tools.lanczos.lin_comb_Q_T` (primal only)."""
     return _native("quspin.tools.lanczos.lin_comb_Q_T")(coeff, Q_T, out=out)
 
 
+@traceable
 def project_op(Obs: object, proj: object, dtype: object = np.complex128) -> Any:
     """Call QuSpin's observable projection routine (primal only)."""
     return _native("quspin.tools.misc.project_op")(Obs, proj, dtype=dtype)
@@ -526,6 +628,26 @@ def _project_vjp(
     return value, pullback
 
 
+@second_ad.rules.jvp2_for(project_op)
+def _project_jvp2(tangents, nested, Obs, proj, dtype=np.complex128):
+    value, first = _projection_jvp(tangents, Obs, proj, dtype)
+    _unsupported(project_op, set(nested), ("Obs", "proj"))
+    observable, projector, down = _projection_inputs(Obs, proj)
+    ou = np.zeros_like(observable) if tangents.get("Obs", ad.ZERO) is ad.ZERO else _same_shape(tangents["Obs"], observable, name="dObs")
+    pu = np.zeros_like(projector) if tangents.get("proj", ad.ZERO) is ad.ZERO else _same_shape(tangents["proj"], projector, name="dproj")
+    ov = np.zeros_like(observable) if nested.get("Obs", ad.ZERO) is ad.ZERO else _same_shape(nested["Obs"], observable, name="nested dObs")
+    pv = np.zeros_like(projector) if nested.get("proj", ad.ZERO) is ad.ZERO else _same_shape(nested["proj"], projector, name="nested dproj")
+    if down:
+        mixed = (pv.conj().T @ ou @ projector + projector.conj().T @ ou @ pv
+                 + pu.conj().T @ ov @ projector + projector.conj().T @ ov @ pu
+                 + pu.conj().T @ observable @ pv + pv.conj().T @ observable @ pu)
+    else:
+        mixed = (pv @ ou @ projector.conj().T + projector @ ou @ pv.conj().T
+                 + pu @ ov @ projector.conj().T + projector @ ov @ pu.conj().T
+                 + pu @ observable @ pv.conj().T + pv @ observable @ pu.conj().T)
+    return value, first, {"Proj_Obs": mixed}
+
+
 @ad.rules.jvp_for(lin_comb_Q_T)
 def _lincomb_jvp(
     tangents: Mapping[str, object], coeff: object, Q_T: object, out: object = None
@@ -579,6 +701,20 @@ def _lincomb_vjp(
     return value, pullback
 
 
+@second_ad.rules.jvp2_for(lin_comb_Q_T)
+def _lincomb_jvp2(tangents, nested, coeff, Q_T, out=None):
+    if out is not None:
+        raise ad.NonDifferentiablePoint("lin_comb_Q_T AD requires out=None")
+    value, first = _lincomb_jvp(tangents, coeff, Q_T, out=out)
+    _unsupported(lin_comb_Q_T, set(nested), ("coeff", "Q_T"))
+    c, q = _array(coeff, name="coeff"), _array(Q_T, name="Q_T")
+    cu = np.zeros_like(c) if tangents.get("coeff", ad.ZERO) is ad.ZERO else _same_shape(tangents["coeff"], c, name="dcoeff")
+    qu = np.zeros_like(q) if tangents.get("Q_T", ad.ZERO) is ad.ZERO else _same_shape(tangents["Q_T"], q, name="dQ_T")
+    cv = np.zeros_like(c) if nested.get("coeff", ad.ZERO) is ad.ZERO else _same_shape(nested["coeff"], c, name="nested dcoeff")
+    qv = np.zeros_like(q) if nested.get("Q_T", ad.ZERO) is ad.ZERO else _same_shape(nested["Q_T"], q, name="nested dQ_T")
+    return value, first, cu @ qv + cv @ qu
+
+
 def register_upstream_rules() -> tuple[str, ...]:
     """Register rules for the actual upstream function identities when present.
 
@@ -607,13 +743,13 @@ def register_upstream_rules() -> tuple[str, ...]:
             # Obtain the private rule functions by callable identity.  This is
             # preferable to maintaining a second, divergent implementation.
             dispatch = {
-                KL_div: (_kl_jvp, _kl_vjp),
-                coherent_state: (_coherent_jvp, _coherent_vjp),
-                commutator: (_comm_jvp, _comm_vjp),
-                anti_commutator: (_anti_jvp, _anti_vjp),
-                ED_state_vs_time: (_ed_jvp, _ed_vjp),
-                lin_comb_Q_T: (_lincomb_jvp, _lincomb_vjp),
-                project_op: (_project_jvp, _project_vjp),
+                KL_div: (_kl_jvp, _kl_vjp, _kl_jvp2),
+                coherent_state: (_coherent_jvp, _coherent_vjp, _coherent_jvp2),
+                commutator: (_comm_jvp, _comm_vjp, _comm_jvp2),
+                anti_commutator: (_anti_jvp, _anti_vjp, _anti_jvp2),
+                ED_state_vs_time: (_ed_jvp, _ed_vjp, _ed_jvp2),
+                lin_comb_Q_T: (_lincomb_jvp, _lincomb_vjp, _lincomb_jvp2),
+                project_op: (_project_jvp, _project_vjp, _project_jvp2),
             }[wrapper]
             # The public registry has no contains operation; duplicate bridge
             # calls are harmlessly ignored based on RuleNotFound probing.
@@ -625,6 +761,10 @@ def register_upstream_rules() -> tuple[str, ...]:
                 ad.rules.get_vjp(native)
             except ad.RuleNotFound:
                 ad.rules.vjp_for(native)(dispatch[1])
+            try:
+                second_ad.rules.get_jvp2(native)
+            except second_ad.RuleNotFound:
+                second_ad.rules.jvp2_for(native)(dispatch[2])
             registered.append(path)
         except (ImportError, ModuleNotFoundError):
             continue
