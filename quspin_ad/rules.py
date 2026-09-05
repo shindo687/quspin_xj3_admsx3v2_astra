@@ -25,6 +25,11 @@ from . import _chainrules as second_ad
 # first-order backend when an external ChainRules package is installed.
 if ad is not second_ad:  # pragma: no cover - exercised with external backend
     second_ad.ZERO = ad.ZERO
+    # The standalone ChainRules package has no bundled second-order protocol;
+    # expose the sidecar's explicit interface on that module as well.
+    for _name in ("nested_jvp", "hvp", "value_grad_and_hvp"):
+        if not hasattr(ad, _name):
+            setattr(ad, _name, getattr(second_ad, _name))
 
 
 def _native(path: str) -> Callable[..., Any]:
